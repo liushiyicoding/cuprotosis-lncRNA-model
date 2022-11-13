@@ -1,0 +1,332 @@
+library(survival)
+library(caret)
+library(glmnet)
+library(survminer)
+library(timeROC)
+library(randomForestSRC)
+library(plsRcox)
+library(superpc)
+library(gbm)
+library(survivalsvm)
+library(dplyr)
+library(tibble)
+library(BART)
+library(leaps) #best subsets regression
+library(class)
+library(kknn)
+library(e1071)
+library(kernlab)
+library(caret)
+library(MASS)
+library(reshape2)
+library(ggplot2)
+library(pROC)
+
+#library(ggsci)
+library(tidyr)
+library(ggbreak)
+
+setwd("C:\\Users\\liu12\\Desktop\\10lncRNA") 
+rm(list=ls())
+coxPfilter=0.005 
+seed<-1
+#####数据导入
+rt=read.table("train.txt", header=T, sep="\t", check.names=F, row.names=1)
+rt$futime=rt$futime/365
+rt[,3:ncol(rt)]=log2(rt[,3:ncol(rt)]+1)
+train<-rt
+trainOut=cbind(id=row.names(train),train)
+sigGenes=c("futime","fustat")
+
+outUniTab=data.frame()
+result <- data.frame()
+
+for(i in colnames(train[,3:ncol(train)])){
+  #cox分析
+  cox <- coxph(Surv(futime, fustat) ~ train[,i], data = train)
+  coxSummary = summary(cox)
+  coxP=coxSummary$coefficients[,"Pr(>|z|)"]
+  
+  #保留显著性基因
+  if(coxP<coxPfilter){
+    sigGenes=c(sigGenes,i)
+    outUniTab=rbind(outUniTab,
+                    cbind(id=i,
+                          HR=coxSummary$conf.int[,"exp(coef)"],
+                          HR.95L=coxSummary$conf.int[,"lower .95"],
+                          HR.95H=coxSummary$conf.int[,"upper .95"],
+                          pvalue=coxSummary$coefficients[,"Pr(>|z|)"])
+    )
+  }
+}
+uniSigExp=train[,sigGenes]
+uniSigExpOut=cbind(id=row.names(uniSigExp),uniSigExp)
+
+
+
+################1.RSF
+seed<-1
+rf_nodesize <- 3
+fit_RSF <- rfsrc(Surv(futime,fustat)~.,data = uniSigExp,
+                 mtry = 3,
+                 ntree = 450,nodesize = rf_nodesize,##该值建议多调整  
+                 splitrule = 'logrank',
+                 importance = T,
+                 proximity = T,
+                 forest = T,
+                 #bootstrap = c("by.root", "none", "by.user"),
+                 seed = seed)
+summary(fit_RSF)
+
+
+rs<-cbind(trainOut[,1:3],RS=predict(fit_RSF,newdata = trainOut)$predicted)
+summary(coxph(Surv(futime,fustat)~RS,rs))
+
+#breast.obj <- rfsrc(Surv(futime,fustat)~.,data = uniSigExp,block.size=1)
+#plot(breast.obj)
+
+
+plot(fit_RSF)
+#plot.survival(fit_RSF, subset = 1:2)
+
+
+
+
+
+
+multiCox <- coxph(Surv(futime, fustat) ~., data =uniSigExp )
+multiCox=step(multiCox, direction = "both")
+multiCoxSum=summary(multiCox)
+multiCoxSum[["coefficients"]]
+
+
+outMultiTab=data.frame()
+outMultiTab=cbind(
+  coef=multiCoxSum$coefficients[,"coef"],
+  HR=multiCoxSum$conf.int[,"exp(coef)"],
+  HR.95L=multiCoxSum$conf.int[,"lower .95"],
+  HR.95H=multiCoxSum$conf.int[,"upper .95"],
+  pvalue=multiCoxSum$coefficients[,"Pr(>|z|)"])
+outMultiTab=cbind(id=row.names(outMultiTab),outMultiTab)
+outMultiTab=outMultiTab[,1:2]
+
+riskScore=predict(multiCox,type="risk",newdata=train)      #利用train得到模型预测train样品风险
+coxGene=rownames(multiCoxSum$coefficients)
+coxGene=gsub("`","",coxGene)
+outCol=c("futime","fustat",coxGene)
+medianTrainRisk=median(riskScore)
+risk=as.vector(ifelse(riskScore>medianTrainRisk,"high","low"))
+trainRiskOut=cbind(id=rownames(cbind(train[,outCol],riskScore,risk)),cbind(train[,outCol],riskScore,risk))
+
+diff=survdiff(Surv(futime, fustat) ~risk,data = train)
+pValue=1-pchisq(diff$chisq, df=1)
+#diffTest=survdiff(Surv(futime, fustat) ~riskTest,data = test)
+#pValueTest=1-pchisq(diffTest$chisq, df=1)
+
+predictTime=1    #预测时间
+roc=timeROC(T=train$futime, delta=train$fustat,
+            marker=riskScore, cause=1,
+            times=c(predictTime), ROC=TRUE)
+
+if((pValue<0.01) & (roc$AUC[2]>0.68) & (pValueTest<0.02) & (rocTest$AUC[2]>0.65)){
+  #输出分组结果
+  write.table(trainOut,file="data.train.txt",sep="\t",quote=F,row.names=F)
+ # write.table(testOut,file="data.test.txt",sep="\t",quote=F,row.names=F)
+  #输出单因素结果
+  
+  #输出多因素结果
+  write.table(outMultiTab,file="multiCox.txt",sep="\t",row.names=F,quote=F)
+  write.table(trainRiskOut,file="risk.train.txt",sep="\t",quote=F,row.names=F)
+  #write.table(testRiskOut,file="risk.test.txt",sep="\t",quote=F,row.names=F)
+  #所有样品的风险值
+  allRiskOut=rbind(trainRiskOut, testRiskOut)
+  write.table(allRiskOut,file="risk.all.txt",sep="\t",quote=F,row.names=F)
+  break
+}
+
+
+cc<-data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,rs))$concordance[1])) %>%
+  rownames_to_column('ID')
+cc$Model <- 'RSF'
+result <- rbind(result,cc)
+
+
+multiCox <- coxph(Surv(futime, fustat) ~ ., data = uniSigExp)
+multiCox=step(multiCox, direction = "both")
+multiCoxSum=summary(multiCox)
+
+
+
+
+###############2.StepCox
+for (direction in c("both", "backward", "forward")) {
+  fit <- step(coxph(Surv(futime,fustat)~.,uniSigExp),direction = direction)
+  rs<-cbind(trainOut[,1:3],RS=predict(fit,type = 'risk',newdata = trainOut))
+  cc<-data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,rs))$concordance[1])) %>%
+    rownames_to_column('ID')
+  cc$Model <- paste0('StepCox','[',direction,']')
+  result <- rbind(result,cc)
+}
+
+#####################3.survival-svm 
+fit = survivalsvm(Surv(futime,fustat)~., data= uniSigExp, gamma.mu = 1)
+summary(fit)
+rs <- cbind(trainOut[,1:3],RS=as.numeric(predict(fit, trainOut)$predicted))
+
+cc <- data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,rs))$concordance[1]))%>%
+  rownames_to_column('ID')
+cc$Model <- paste0('survival-SVM')
+result <- rbind(result,cc)
+
+
+#################4.GBM
+set.seed(seed)
+fit <- gbm(formula = Surv(futime,fustat)~.,data = uniSigExp,distribution = 'coxph',
+           n.trees = 10000,
+           interaction.depth = 3,
+           n.minobsinnode = 10,
+           shrinkage = 0.001,
+           cv.folds = 10,n.cores = 6)
+# find index for number trees with minimum CV error
+best <- which.min(fit$cv.error)
+set.seed(seed)
+fit <- gbm(formula = Surv(futime,fustat)~.,data = uniSigExp,distribution = 'coxph',
+           n.trees = best,
+           interaction.depth = 3,
+           n.minobsinnode = 10,
+           shrinkage = 0.001,
+           cv.folds = 10,n.cores = 8)
+RS=as.numeric(predict(fit,trainOut,n.trees = best,type = 'link'))
+rs <- cbind(trainOut[,1:3],RS=as.numeric(predict(fit,trainOut,n.trees = best,type = 'link')))
+cc <- data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,trainOut))$concordance[1]))%>%
+  rownames_to_column('ID')
+cc$Model <- paste0('GBM')
+result <- rbind(result,cc)
+
+#########5.StepCox+gbm
+for (direction in c("both", "backward","forward")) {
+  fit <- step(coxph(Surv(futime,fustat)~.,uniSigExp),direction = "both")
+  rid <- names(coef(fit))
+  est_dd2 <- uniSigExp[,c('futime','fustat', rid )]
+  val_dd_list2 <- trainOut[,c('futime','fustat',rid)]
+  
+  fit = survivalsvm(Surv(futime,fustat)~., data= est_dd2, gamma.mu = 1)
+  rs <- cbind(val_dd_list2[,1:2],RS=as.numeric(predict(fit, val_dd_list2)$predicted))
+  cc <- data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,val_dd_list2))$concordance[1]))%>%
+    rownames_to_column('ID')
+  cc$Model <- paste0('StepCox','[',direction,']',' + survival-SVM')
+  result <- rbind(result,cc)
+}
+
+#######6.Enet
+x1 <- as.matrix(uniSigExp[,-c(1:3)])
+x2 <- as.matrix(Surv(uniSigExp$futime,uniSigExp$fustat))
+
+for (alpha in seq(0,1,0.1)) {
+  set.seed(seed)
+  fit = cv.glmnet(x1, x2,family = "cox",alpha=alpha,nfolds = 10)
+  RS=as.numeric(predict(fit,type='link',newx=as.matrix(uniSigExp[,-c(1:3)]),s=fit$lambda.min))
+  rs <- cbind(trainOut[,1:3],RS=as.numeric(predict(fit,type='link',newx=as.matrix(uniSigExp[,-c(1:3)]),s=fit$lambda.min)))
+  cc <- data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,rs))$concordance[1]))%>%
+    rownames_to_column('ID')
+  cc$Model <- paste0('Enet','[α=',alpha,']')
+  result <- rbind(result,cc)
+}
+
+#### 7.plsRcox
+set.seed(seed)
+cv.plsRcox.res=cv.plsRcox(list(x=uniSigExp[,-c(1:3)],time=uniSigExp$futime,status=uniSigExp$fustat),nt=10,verbose = FALSE)
+fit <- plsRcox(uniSigExp[,-c(1:3)],time=uniSigExp$futime,event=uniSigExp$fustat,nt=as.numeric(cv.plsRcox.res[5]))
+rs <- cbind(trainOut[,1:3],RS=as.numeric(predict(fit,type="lp",newdata=uniSigExp[,-c(1:3)])))
+
+cc <- data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,rs))$concordance[1]))%>%
+  rownames_to_column('ID')
+cc$Model <- paste0('plsRcox')
+result <- rbind(result,cc)
+
+#### 8.superpc####
+
+
+data <- list(x=t(uniSigExp[,-c(1:3)]),y=uniSigExp$futime,censoring.status=uniSigExp$fustat,featurenames=colnames(uniSigExp)[-c(1:3)])
+set.seed(seed)
+fit <- superpc.train(data = data,type = 'survival',s0.perc = 0.5) #default
+cv.fit <- superpc.cv(fit,data,n.threshold = 20,#default 
+                     n.fold = 10,
+                     n.components=3,
+                     min.features=5,
+                     max.features=nrow(data$x),
+                     compute.fullcv= TRUE,
+                     compute.preval=TRUE)
+test <- list(x=t(uniSigExp[,-c(1:3)]),y=uniSigExp$futime,censoring.status=uniSigExp$fustat,featurenames=colnames(uniSigExp)[-c(1:2)])
+ff <- superpc.predict(fit,data,test,threshold = cv.fit$thresholds[which.max(cv.fit[["scor"]][1,])],n.components = 1)
+rr <- as.numeric(ff$v.pred)
+rr2 <- cbind(uniSigExp[,1:3],RS=rr)
+rs<-rr2
+
+cc <- data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,rs))$concordance[1]))%>%
+  rownames_to_column('ID')
+cc$Model <- paste0('SuperPC')
+result <- rbind(result,cc)
+
+###########9.lasso
+x=as.matrix(uniSigExp[,c(3:ncol(uniSigExp))])
+y=data.matrix(Surv(uniSigExp$futime,uniSigExp$fustat))
+fit <- glmnet(x, y, family = "cox",alpha = 1)
+
+s<-min(fit$lambda)
+
+rs <- cbind(trainOut[,1:3],RS=as.numeric(predict(fit,type='link',newx=x,s=s)))
+cc <- data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,rs))$concordance[1]))%>%
+  rownames_to_column('ID')
+
+cc$Model <- 'lasso'
+result <- rbind(result,cc)
+
+#########10.ridge
+x=as.matrix(uniSigExp[,c(3:ncol(uniSigExp))])
+y=data.matrix(Surv(uniSigExp$futime,uniSigExp$fustat))
+fit <- glmnet(x, y, family = "cox",alpha = 0)
+
+s<-min(fit$lambda)
+
+rs <- cbind(trainOut[,1:3],RS=as.numeric(predict(fit,type='link',newx=x,s=s)))
+cc <- data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,rs))$concordance[1]))%>%
+  rownames_to_column('ID')
+
+cc$Model <- 'Ridge'
+result <- rbind(result,cc)
+
+
+#########11.KNN
+set.seed(seed)
+grid1 <- expand.grid(.k = seq(2, 20, by = 1))
+control = trainControl(method = "cv")
+
+kknn.train <- train.kknn(Surv(uniSigExp$futime,uniSigExp$fustat) ~ ., data = uniSigExp, 
+                         kmax = 25, distance = 2, 
+                         kernel = c("rectangular", "triangular", "epanechnikov"))               
+plot(kknn.train)
+kknn.train       
+RS=as.numeric(predict(kknn.train, newdata = uniSigExp))
+rs <- cbind(trainOut[,1:3],RS=as.numeric(predict(kknn.train, newdata = uniSigExp)))
+cc <- data.frame(Cindex=as.numeric(summary(coxph(Surv(futime,fustat)~RS,rs))$concordance[1]))%>%
+  rownames_to_column('ID')
+cc$Model <- 'KNN'
+result <- rbind(result,cc)
+
+
+result2 <- result
+result2$Model <- gsub('α','a',result2$Model)
+
+range(result2$Cindex)
+result2%>%filter(ID!='TCGA')%>%
+  ggplot(aes(Cindex,reorder(Model,Cindex)))+
+  geom_bar(width = 0.7,stat = 'summary',fun='mean',fill='orange2')+
+  theme_classic()+
+  labs(y=NULL)
+
+dd <- result2%>%
+  #filter(ID!='TCGA')%>%
+  group_by(Model)%>%
+  summarise(Cindex=mean(Cindex))
+
